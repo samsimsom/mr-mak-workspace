@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { mkdir, realpath, stat } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import path from 'node:path';
 import pty from 'node-pty';
 import headless from '@xterm/headless';
@@ -239,8 +240,8 @@ export class Sessions extends EventEmitter {
       }).catch(() => {});
       if (session.agent === 'pi') readPiState(this.stateDir, session.id).then(state => {
         if (state?.launchId !== env.MRMAK_PI_LAUNCH_ID) return;
-        this.switchNative(session, state.nativeId);
-        if (state.completion && session.nativeId === state.nativeId) this.nativeEvent(session, { kind: 'turn-completed', id: state.completion });
+        this.switchNative(session, state);
+        if (state.completion) this.nativeEvent(session, { kind: 'turn-completed', id: state.completion });
       }).catch(() => {});
     });
     this.changed(session);
@@ -258,7 +259,9 @@ export class Sessions extends EventEmitter {
       else if (state.activity === 'idle' && session.activity !== 'idle') this.nativeEvent(session, { kind: 'turn-interrupted' });
     });
     if (session.agent === 'pi') session.stopNativeWatch = watchPi(this.stateDir, session, env.MRMAK_PI_LAUNCH_ID, state => {
-      if (session.process !== proc || !this.switchNative(session, state.nativeId)) return;
+      if (session.process !== proc) return;
+      // Activity belongs to this terminal even when its session is linked elsewhere.
+      this.switchNative(session, state);
       if (state.completion) this.nativeEvent(session, { kind: 'turn-completed', id: state.completion });
       if (state.activity === 'working') this.nativeEvent(session, { kind: 'turn-started' });
       else if (state.activity === 'waiting') this.nativeEvent(session, { kind: 'attention' });
@@ -354,21 +357,24 @@ export class Sessions extends EventEmitter {
     }
     if (session.agent === 'pi') {
       const state = await readPiState(this.stateDir, session.id);
-      if (state) this.switchNative(session, state.nativeId);
+      if (state) this.switchNative(session, state);
       return;
     }
     if (session.agent !== 'codex' || session.nativeId) return;
     this.bindNative(session, await findCodexChat(session, { full: true }));
   }
 
-  // Pi's /new, /resume and /fork move the terminal to another session. Follow it
-  // unless another chat already owns that session. True when the chat is on it.
-  switchNative(session, id) {
-    if (!id || id === session.nativeId) return !!id;
-    if ([...this.items.values()].some(item => item !== session && item.nativeId === id)) return false;
+  // Pi's /new, /resume and /fork move the terminal to another session, and a
+  // /resume of another project's session also moves Pi to that folder. Follow
+  // both, so --session-id finds the session again, unless another chat owns it.
+  switchNative(session, { nativeId: id, cwd }) {
+    if (!id || id === session.nativeId) return;
+    if ([...this.items.values()].some(item => item !== session && item.nativeId === id)) return;
     session.nativeId = id; session.restoreError = null;
+    // Pi reports the real path; keep the chat's own spelling of the same folder.
+    const same = folder => { try { return realpathSync.native(folder) === cwd; } catch { return false; } };
+    if (cwd && cwd !== session.cwd && !same(session.cwd)) session.cwd = cwd;
     this.changed(session);
-    return true;
   }
 
   bindAntigravity(session, id) {

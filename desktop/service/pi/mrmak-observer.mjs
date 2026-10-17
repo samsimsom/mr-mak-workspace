@@ -8,7 +8,7 @@ export default function mrmakObserver(pi) {
   if (!observe) return;
   const assistant = message => message?.role === 'assistant' ? message : null;
   pi.on('session_start', (_event, ctx) => {
-    try { observe({ type: 'session', id: ctx?.sessionManager?.getSessionId?.() }); } catch { /* Never break Pi. */ }
+    try { observe({ type: 'session', id: ctx?.sessionManager?.getSessionId?.(), cwd: ctx?.sessionManager?.getCwd?.() }); } catch { /* Never break Pi. */ }
   });
   pi.on('agent_start', () => observe({ type: 'agent_start' }));
   pi.on('message_end', event => {

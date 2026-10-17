@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createObserver, validSessionId } from '../pi/observer.mjs';
 import mrmakObserver from '../pi/mrmak-observer.mjs';
-import { piEnvironment, piExtension, piStatePath, readPiState } from '../pi.mjs';
+import { piEnvironment, piExtension, piStatePath, readPiState, watchPi } from '../pi.mjs';
 import { childEnvironment, terminalCommand } from '../agents.mjs';
 import { Sessions } from '../sessions.mjs';
 
@@ -62,8 +62,9 @@ test('the Pi observer reports work, final answers, prompts, errors and interrupt
   send({ type: 'agent_start' });
   send({ type: 'message_end', role: 'assistant', stopReason: 'stop' });
   send({ type: 'agent_settled' });
-  assert.equal(state().completion, 'launch-a:5');
-  for (const state of states) assert.deepEqual([state.chatId, state.launchId, state.nativeId], ['chat-a', 'launch-a', id]);
+  assert.equal(state().completion, 'launch-a:12', 'a fallback ID is unique within the launch');
+  for (const state of states) assert.deepEqual([state.chatId, state.launchId, state.nativeId, state.cwd], ['chat-a', 'launch-a', id, null]);
+  assert.deepEqual(states.map(state => state.revision), states.map((_, index) => index + 1));
 });
 
 test('the Pi observer follows /new and ignores invalid sessions and events before one', () => {
@@ -74,8 +75,10 @@ test('the Pi observer follows /new and ignores invalid sessions and events befor
   send({ type: 'session', id });
   assert.equal(state().nativeId, id);
   send({ type: 'agent_start' });
-  send({ type: 'session', id: 'next-session' });
-  assert.deepEqual([state().nativeId, state().activity], ['next-session', 'idle']);
+  send({ type: 'session', id: 'next-session', cwd: '/other/project' });
+  assert.deepEqual([state().nativeId, state().cwd, state().activity], ['next-session', '/other/project', 'idle']);
+  send({ type: 'session', id: 'third-session', cwd: 'relative/path' });
+  assert.equal(state().cwd, null, 'only an absolute folder is reported');
   send({ type: 'agent_settled', aborted: false });
   assert.equal(state().completion, null, 'a run of the previous session does not complete the new one');
 });
@@ -107,13 +110,76 @@ test('the Pi extension writes a private state file only when Mr. Mak launched it
   }
 });
 
+test('a new Pi extension runtime after /new, /resume, /fork or /reload continues the launch state', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'mrmak-pi-runtime-'));
+  const keys = ['MRMAK_PI_STATE', 'MRMAK_PI_CHAT_ID', 'MRMAK_PI_LAUNCH_ID', 'MRMAK_PI_SESSION_ID'];
+  const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  const seen = [];
+  const stop = watchPi(dir, { id: 'chat-a' }, 'launch-a', state => seen.push(state));
+  const load = () => { const handlers = {}; mrmakObserver({ on: (name, handler) => { (handlers[name] ||= []).push(handler); } }); return (name, event = { type: name }, ctx) => handlers[name].forEach(handler => handler(event, ctx)); };
+  const session = (sessionId, cwd = dir) => ({ sessionManager: { getSessionId: () => sessionId, getCwd: () => cwd } });
+  // Waits until the 300 ms poll has delivered the latest write.
+  const settle = async () => {
+    const written = JSON.parse(await readFile(piStatePath(dir, 'chat-a'), 'utf8')).revision;
+    for (let i = 0; i < 80 && seen.at(-1)?.revision !== written; i++) await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(seen.at(-1)?.revision, written, 'the host saw the latest write');
+  };
+  try {
+    Object.assign(process.env, { MRMAK_PI_STATE: piStatePath(dir, 'chat-a'), MRMAK_PI_CHAT_ID: 'chat-a', MRMAK_PI_LAUNCH_ID: 'launch-a', MRMAK_PI_SESSION_ID: id });
+    let fire = load();
+    fire('session_start', { type: 'session_start', reason: 'startup' }, session(id));
+    for (let turn = 0; turn < 3; turn++) { fire('agent_start'); fire('agent_settled', { type: 'agent_settled', aborted: false }); }
+    await settle();
+    const before = seen.at(-1).revision;
+    // /new: Pi calls the extension factory again in the same process.
+    fire = load();
+    fire('session_start', { type: 'session_start', reason: 'new' }, session('after-new'));
+    await settle();
+    assert.deepEqual([seen.at(-1).nativeId, seen.at(-1).revision > before], ['after-new', true]);
+    fire('agent_start'); await settle();
+    assert.equal(seen.at(-1).activity, 'working', 'the first turn after /new is reported');
+    fire('agent_settled', { type: 'agent_settled', aborted: false }); await settle();
+    assert.equal(seen.at(-1).completion, `launch-a:${seen.at(-1).revision}`);
+    // /reload keeps the session: the new runtime starts from it and stays quiet.
+    const count = seen.length;
+    fire = load();
+    fire('session_start', { type: 'session_start', reason: 'reload' }, session('after-new'));
+    await new Promise(resolve => setTimeout(resolve, 400));
+    assert.equal(seen.length, count);
+    // /resume of another project's session reports its folder.
+    fire('session_start', { type: 'session_start', reason: 'resume' }, session('elsewhere', '/other/project'));
+    await settle();
+    assert.deepEqual([seen.at(-1).nativeId, seen.at(-1).cwd], ['elsewhere', '/other/project']);
+  } finally {
+    stop();
+    for (const key of keys) if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key];
+  }
+});
+
+test('a Pi chat never takes over a session another chat owns, but still shows its own activity', async () => {
+  const repo = await mkdtemp(path.join(os.tmpdir(), 'mrmak-pi-owner-'));
+  const sessions = await new Sessions(repo, repo).init();
+  try {
+    const owner = sessions.make({ id: 'owner', agent: 'pi', name: 'Owner Chat', cwd: repo, nativeId: 'shared', open: false });
+    const other = sessions.make({ id: 'other', agent: 'pi', name: 'Other Chat', cwd: repo, nativeId: id, open: false });
+    sessions.items.set(owner.id, owner); sessions.items.set(other.id, other);
+    sessions.switchNative(other, { nativeId: 'shared', cwd: '/other/project' });
+    assert.deepEqual([other.nativeId, other.cwd], [id, repo]);
+    sessions.switchNative(other, { nativeId: 'fresh', cwd: await realpath(repo) });
+    assert.deepEqual([other.nativeId, other.cwd], ['fresh', repo], 'the same folder keeps its spelling');
+    sessions.switchNative(other, { nativeId: 'moved', cwd: '/other/project' });
+    assert.deepEqual([other.nativeId, other.cwd], ['moved', '/other/project']);
+  } finally { await sessions.close(); }
+});
+
 test('Pi launch flags load the observer, keep the session and pass reasoning only when chosen', async () => {
   const bin = await mkdtemp(path.join(os.tmpdir(), 'mrmak-pi-bin-'));
   await writeFile(path.join(bin, process.platform === 'win32' ? 'pi.cmd' : 'pi'), '', { mode: 0o755 });
   await withPath(bin, () => {
-    const text = command => process.platform === 'win32' ? Buffer.from(command.args.at(-1), 'base64').toString('utf16le') : command.args.join(' ');
+    const text = command => process.platform === 'win32' ? Buffer.from(command.args.at(-1), 'base64').toString('utf16le').replaceAll("'", '') : command.args.join(' ');
     for (const bypass of [false, true]) {
       const launch = text(terminalCommand('pi', { bypass, nativeId: id, effort: 'xhigh' }));
+    // On Windows the decoded PowerShell script quotes every argument.
       assert.ok(launch.includes(`--extension ${piExtension}`));
       assert.ok(launch.includes(`--session-id ${id}`));
       assert.ok(launch.includes('--thinking xhigh'));

@@ -24,7 +24,8 @@ export async function readPiState(stateDir, chatId) {
     const file = piStatePath(stateDir, chatId);
     if ((await stat(file)).size > 4096) return null;
     const state = JSON.parse(await readFile(file, 'utf8'));
-    return state.chatId === chatId && validSessionId(state.nativeId) ? state : null;
+    if (state.chatId !== chatId || !validSessionId(state.nativeId)) return null;
+    return { ...state, cwd: typeof state.cwd === 'string' && path.isAbsolute(state.cwd) && !/[\x00-\x1f]/.test(state.cwd) ? state.cwd : null };
   } catch { return null; }
 }
 
