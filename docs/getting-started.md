@@ -79,7 +79,7 @@ apply when it is enabled.
 OpenCode 1.x and 2.x use different plugin APIs. Mr. Mak selects the corresponding
 small session observer at launch, without writing global configuration. OpenCode
 2.x runs a private server for each terminal so tab histories stay separate.
-The MCP inspector currently lists Claude, Codex, Kimi and Cursor configurations;
+The MCP inspector currently lists Claude, Codex, Kimi, Cursor and Pi configurations;
 use OpenCode's native MCP controls to inspect its own connections.
 
 ## Explore the examples
