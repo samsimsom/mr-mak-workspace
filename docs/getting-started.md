@@ -40,6 +40,10 @@ your operating system:
 [Kimi Code CLI](https://moonshotai.github.io/kimi-cli/en/) is available as an
 additional terminal integration after the base setup.
 
+[Pi](https://pi.dev/) is another terminal integration. Pi uses your own providers:
+sign in with `/login` or set a provider API key, then choose a model with `/model`.
+Pi has no permission prompts, so New chat shows no bypass option for it.
+
 Finish the CLI's sign-in flow with your own account. In Chats, press **+**, choose
 the provider and a descriptive English title. Start with a task such as
 `Dream Game Plan`. Choose the repository as the working folder. The normal CLI

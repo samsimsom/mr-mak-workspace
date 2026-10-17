@@ -13,6 +13,7 @@ import { englishTitle, groupLabel, restoredTitle } from './titles.mjs';
 import { defaultWorkerEffort, workerEfforts } from './effort.mjs';
 import { ptyOptions } from './platform.mjs';
 import { opencodeVersion, opencodeEnvironment, readOpencodeState, watchOpencode } from './opencode.mjs';
+import { piEnvironment, readPiState, watchPi } from './pi.mjs';
 import { prepareAntigravityLog, readAntigravityConversation, validAntigravityId, watchAntigravity } from './antigravity.mjs';
 
 const { Terminal } = headless;
@@ -65,7 +66,7 @@ export class Sessions extends EventEmitter {
   }
 
   make(metadata) {
-    return { activity: 'idle', unread: false, completionVersion: 0, tabOrder: this.items.size, tabColor: null, group: null, ...metadata, effort: ['codex', 'claude', 'antigravity'].includes(metadata.agent) ? metadata.effort || defaultWorkerEffort : undefined, terminal: null, serializer: null, process: null, sequence: 0, pendingOutput: '', outputTimer: null };
+    return { activity: 'idle', unread: false, completionVersion: 0, tabOrder: this.items.size, tabColor: null, group: null, ...metadata, effort: ['codex', 'claude', 'antigravity'].includes(metadata.agent) ? metadata.effort || defaultWorkerEffort : metadata.agent === 'pi' ? metadata.effort : undefined, terminal: null, serializer: null, process: null, sequence: 0, pendingOutput: '', outputTimer: null };
   }
 
   async hydrate(session) {
@@ -120,9 +121,9 @@ export class Sessions extends EventEmitter {
     const session = this.make({
       id: randomUUID(), agent, name: englishTitle(options.name, `Conversation ${this.items.size + 1}`),
       tabOrder: Math.max(-1, ...this.list().map(item => item.tabOrder)) + 1,
-      cwd, bypass: options.bypass === true, createdAt: now, lastInputAt: null, lastOutputAt: null,
+      cwd, bypass: options.bypass === true && agent !== 'pi', createdAt: now, lastInputAt: null, lastOutputAt: null,
       effort: options.effort, group: groupLabel(options.group),
-      status: 'starting', nativeId: options.resumeId || (agent === 'claude' ? randomUUID() : null),
+      status: 'starting', nativeId: options.resumeId || (['claude', 'pi'].includes(agent) ? randomUUID() : null),
       open: true, pinned: false, updatedAt: now, preview: '', hasConversation: !!options.resumeId || !!options.initialPrompt, restoreError: null,
       attention: false, cols: Math.min(500, Math.max(20, options.cols || 90)), rows: Math.min(200, Math.max(5, options.rows || 32)),
     });
@@ -137,7 +138,7 @@ export class Sessions extends EventEmitter {
   }
 
   async importConversation({ agent, nativeId, name, cwd, pinned = false, bypass = false, group = null }) {
-    if (!['codex', 'claude', 'antigravity', 'opencode', 'kimi'].includes(agent) || typeof nativeId !== 'string' || !nativeId.trim()) throw new Error('Choose an agent and its native conversation ID.');
+    if (!['codex', 'claude', 'antigravity', 'opencode', 'kimi', 'pi'].includes(agent) || typeof nativeId !== 'string' || !nativeId.trim()) throw new Error('Choose an agent and its native conversation ID.');
     nativeId = nativeConversationId(nativeId.trim());
     if (agent === 'antigravity' && !validAntigravityId(nativeId)) throw new Error('Use the Antigravity conversation UUID from its /resume picker.');
     cwd = await workingFolder(cwd || this.repo);
@@ -173,6 +174,11 @@ export class Sessions extends EventEmitter {
       if (opencodeMajor === 2 && !session.nativeId) session.nativeId = `ses_${randomUUID().replaceAll('-', '')}`;
       if (opencodeMajor === 2) resumeId ||= session.nativeId;
       env = opencodeEnvironment(env, { stateDir: this.stateDir, session, major: opencodeMajor });
+    }
+    if (session.agent === 'pi') {
+      // Like Claude, the ID is assigned before launch: Pi resumes or creates it.
+      if (!session.nativeId) session.nativeId = randomUUID();
+      env = piEnvironment(env, { stateDir: this.stateDir, session });
     }
     if (this.closed || !session.open) throw new Error('The chat was closed before its terminal started.');
     if (session.agent === 'antigravity' && resumeId && !validAntigravityId(resumeId)) throw new Error('Use the Antigravity conversation UUID from its /resume picker.');
@@ -231,6 +237,11 @@ export class Sessions extends EventEmitter {
           if (state.completion && session.nativeId === state.nativeId) this.nativeEvent(session, { kind: 'turn-completed', id: state.completion });
         }
       }).catch(() => {});
+      if (session.agent === 'pi') readPiState(this.stateDir, session.id).then(state => {
+        if (state?.launchId !== env.MRMAK_PI_LAUNCH_ID) return;
+        this.switchNative(session, state.nativeId);
+        if (state.completion && session.nativeId === state.nativeId) this.nativeEvent(session, { kind: 'turn-completed', id: state.completion });
+      }).catch(() => {});
     });
     this.changed(session);
     // Discovery is read-only, and only accepts an unambiguous native session.
@@ -241,6 +252,13 @@ export class Sessions extends EventEmitter {
     if (session.agent === 'opencode') session.stopNativeWatch = watchOpencode(this.stateDir, session, env.MRMAK_OPENCODE_LAUNCH_ID, state => {
       this.bindNative(session, { id: state.nativeId });
       if (session.nativeId !== state.nativeId) return;
+      if (state.completion) this.nativeEvent(session, { kind: 'turn-completed', id: state.completion });
+      if (state.activity === 'working') this.nativeEvent(session, { kind: 'turn-started' });
+      else if (state.activity === 'waiting') this.nativeEvent(session, { kind: 'attention' });
+      else if (state.activity === 'idle' && session.activity !== 'idle') this.nativeEvent(session, { kind: 'turn-interrupted' });
+    });
+    if (session.agent === 'pi') session.stopNativeWatch = watchPi(this.stateDir, session, env.MRMAK_PI_LAUNCH_ID, state => {
+      if (session.process !== proc || !this.switchNative(session, state.nativeId)) return;
       if (state.completion) this.nativeEvent(session, { kind: 'turn-completed', id: state.completion });
       if (state.activity === 'working') this.nativeEvent(session, { kind: 'turn-started' });
       else if (state.activity === 'waiting') this.nativeEvent(session, { kind: 'attention' });
@@ -334,8 +352,23 @@ export class Sessions extends EventEmitter {
       if (state) this.bindNative(session, { id: state.nativeId });
       return;
     }
+    if (session.agent === 'pi') {
+      const state = await readPiState(this.stateDir, session.id);
+      if (state) this.switchNative(session, state.nativeId);
+      return;
+    }
     if (session.agent !== 'codex' || session.nativeId) return;
     this.bindNative(session, await findCodexChat(session, { full: true }));
+  }
+
+  // Pi's /new, /resume and /fork move the terminal to another session. Follow it
+  // unless another chat already owns that session. True when the chat is on it.
+  switchNative(session, id) {
+    if (!id || id === session.nativeId) return !!id;
+    if ([...this.items.values()].some(item => item !== session && item.nativeId === id)) return false;
+    session.nativeId = id; session.restoreError = null;
+    this.changed(session);
+    return true;
   }
 
   bindAntigravity(session, id) {
@@ -540,7 +573,7 @@ export class Sessions extends EventEmitter {
   requestStop(session) {
     const proc = session.process;
     if (!proc) return;
-    if (!['opencode', 'antigravity', 'claude'].includes(session.agent)) { proc.kill(); return; }
+    if (!['opencode', 'antigravity', 'claude', 'pi'].includes(session.agent)) { proc.kill(); return; }
     // Let OpenCode flush and close its SQLite store before ConPTY is destroyed,
     // and let Claude leave its fullscreen renderer the way it expects: a killed
     // fullscreen session counts as a failed start on its side, and two of those
@@ -548,7 +581,8 @@ export class Sessions extends EventEmitter {
     // Ctrl+C cancels work; a second press exits the native TUI. Custom keymaps
     // or an unresponsive CLI still have a bounded hard-stop fallback.
     proc.write('\x03');
-    setTimeout(() => { try { if (session.process === proc) proc.write('\x03'); } catch { /* Process already exited. */ } }, 500).unref();
+    // Pi exits only when the second press comes within 500 ms.
+    setTimeout(() => { try { if (session.process === proc) proc.write('\x03'); } catch { /* Process already exited. */ } }, session.agent === 'pi' ? 200 : 500).unref();
     setTimeout(() => { try { if (session.process === proc) proc.kill(); } catch { /* Process already exited. */ } }, 3500).unref();
   }
   async resume(id, nativeId) {
@@ -626,7 +660,7 @@ export class Sessions extends EventEmitter {
     this.closed = true; clearInterval(this.timer);
     // Preserve the open-tab flags on app quit while giving OpenCode time to
     // close the database used by the next launch.
-    await Promise.all([...this.items.values()].filter(s => ['opencode', 'antigravity', 'claude'].includes(s.agent) && s.process).map(session => new Promise(resolve => {
+    await Promise.all([...this.items.values()].filter(s => ['opencode', 'antigravity', 'claude', 'pi'].includes(s.agent) && s.process).map(session => new Promise(resolve => {
       const proc = session.process;
       const timer = setTimeout(() => { subscription.dispose(); resolve(); }, 5000);
       const subscription = proc.onExit(() => { clearTimeout(timer); subscription.dispose(); resolve(); });
