@@ -231,9 +231,13 @@ sleep 0.6
       const original = sessions.get(created.id);
       assert.equal(created.bypass, false, 'Pi has no permission prompts to bypass');
       assert.equal(created.effort, undefined, 'Pi keeps its own thinking default');
-      assert.match(created.nativeId, /^[0-9a-f-]{36}$/);
-      const assigned = created.nativeId;
-      for (let i = 0; i < 40 && original.nativeId === assigned; i++) await new Promise(resolve => setTimeout(resolve, 50));
+      // The fake Pi can switch to its /new session before create() returns (seen on
+      // Linux CI), so take the assigned ID from its command line.
+      const launched = async () => (await readFile(log, 'utf8').catch(() => '')).trim();
+      for (let i = 0; i < 40 && !(await launched()); i++) await new Promise(resolve => setTimeout(resolve, 50));
+      const assigned = /--session-id (\S+)/.exec(await launched())?.[1];
+      assert.match(assigned, /^[0-9a-f-]{36}$/);
+      for (let i = 0; i < 40 && original.nativeId !== 'after-new'; i++) await new Promise(resolve => setTimeout(resolve, 50));
       assert.equal(original.nativeId, 'after-new');
       for (let i = 0; i < 40 && original.lastCompletedId !== 'entry-1'; i++) await new Promise(resolve => setTimeout(resolve, 50));
       assert.equal(original.lastCompletedId, 'entry-1');
